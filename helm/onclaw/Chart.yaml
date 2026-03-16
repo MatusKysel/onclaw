@@ -1,0 +1,6 @@
+apiVersion: v2
+name: onclaw
+description: Automated on-call first responder for Kubernetes alerts
+version: 0.1.0
+appVersion: "0.1.0"
+type: application

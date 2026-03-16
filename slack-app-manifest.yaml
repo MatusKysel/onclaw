@@ -1,0 +1,34 @@
+# Slack App Manifest
+# Go to https://api.slack.com/apps → "Create New App" → "From a manifest"
+# Paste this YAML and click Create.
+
+display_information:
+  name: Onclaw
+  description: Automated on-call first responder — investigates K8s alerts and posts summaries
+  background_color: "#1a1a2e"
+
+features:
+  bot_user:
+    display_name: Onclaw
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - channels:history
+      - channels:read
+      - chat:write
+      - reactions:write
+      - groups:history
+      - groups:read
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

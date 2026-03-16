@@ -1,0 +1,11 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-readonly
+  labels:
+    app.kubernetes.io/name: onclaw
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "namespaces"]
+    verbs: ["get", "list"]

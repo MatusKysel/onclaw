@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-readonly
+  labels:
+    app.kubernetes.io/name: onclaw
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Release.Name }}-readonly
+  apiGroup: rbac.authorization.k8s.io

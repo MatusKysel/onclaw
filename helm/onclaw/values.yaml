@@ -1,0 +1,41 @@
+# Required:
+anthropicApiKey: ""     # sk-ant-...
+
+# Slack (optional — set both to enable):
+slackAppToken: ""       # xapp-...
+slackBotToken: ""       # xoxb-...
+
+# Telegram (optional — set to enable):
+telegramBotToken: ""    # from @BotFather
+
+# Optional overrides:
+image:
+  repository: onclaw
+  tag: latest
+  pullPolicy: IfNotPresent
+
+claudeModel: "claude-sonnet-4-20250514"
+claudeMaxTokens: 4096
+maxLogLines: 200
+maxConcurrentInvestigations: 3
+
+# Optional: mount a kubeconfig Secret for multi-cluster support
+# Create the secret first: kubectl create secret generic onclaw-kubeconfig --from-file=kubeconfig=$HOME/.kube/config
+kubeconfig:
+  enabled: false
+  secretName: onclaw-kubeconfig
+  key: kubeconfig
+
+# Persistence for investigation memory
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
