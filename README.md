@@ -175,9 +175,11 @@ rules:
 | `KUBECONFIG` | No | Path to kubeconfig (default: `~/.kube/config`) |
 | `ONCLAW_MEMORY_PATH` | No | SQLite DB path (default: `onclaw_memory.db`) |
 | `CLAUDE_MODEL` | No | Model to use (default: `claude-sonnet-4-20250514`) |
+| `CLAUDE_FAST_MODEL` | No | Cheaper model for classification/pod selection (default: `claude-haiku-4-5-20251001`) |
 | `CLAUDE_MAX_TOKENS` | No | Max response tokens (default: `4096`) |
 | `MAX_LOG_LINES` | No | Log lines per pod (default: `200`) |
 | `MAX_CONCURRENT_INVESTIGATIONS` | No | Parallel investigations (default: `3`) |
+| `MAX_FOLLOW_UP_DEPTH` | No | Max AI-driven follow-up hops across related pods (default: `3`) |
 
 *At least one platform must be configured (Slack or Telegram).
 

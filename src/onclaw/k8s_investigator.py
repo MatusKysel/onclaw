@@ -21,6 +21,9 @@ class PodInfo:
     ready: bool
     age: str
     container_statuses: list[dict[str, str]]
+    # Diagnostics for unhealthy pods — why is it down?
+    conditions: list[dict[str, str]] = field(default_factory=list)
+    last_terminated: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +56,37 @@ class InvestigationData:
     events: list[K8sEvent] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     total_pod_count: int = 0
+
+
+    def merge(self, other: InvestigationData) -> None:
+        """Merge another round's data, deduplicating pods/logs/events."""
+        existing_pods = {(p.namespace, p.name) for p in self.pods}
+        for p in other.pods:
+            if (p.namespace, p.name) not in existing_pods:
+                self.pods.append(p)
+
+        existing_unhealthy = {(p.namespace, p.name) for p in self.unhealthy_pods}
+        for p in other.unhealthy_pods:
+            if (p.namespace, p.name) not in existing_unhealthy:
+                self.unhealthy_pods.append(p)
+
+        existing_logs = {
+            (l.namespace, l.pod_name, l.container_name, l.is_previous)
+            for l in self.pod_logs
+        }
+        for log in other.pod_logs:
+            key = (log.namespace, log.pod_name, log.container_name, log.is_previous)
+            if key not in existing_logs:
+                self.pod_logs.append(log)
+
+        existing_events = {
+            (e.namespace, e.involved_object, e.reason, e.message) for e in self.events
+        }
+        for e in other.events:
+            if (e.namespace, e.involved_object, e.reason, e.message) not in existing_events:
+                self.events.append(e)
+
+        self.errors.extend(other.errors)
 
 
 @dataclass
@@ -105,7 +139,7 @@ def _is_unhealthy(pod: client.V1Pod) -> bool:
     return False
 
 
-def _extract_pod_info(pod: client.V1Pod) -> PodInfo:
+def _extract_pod_info(pod: client.V1Pod, unhealthy: bool = False) -> PodInfo:
     status = pod.status
     container_statuses_info: list[dict[str, str]] = []
     total_restarts = 0
@@ -126,6 +160,30 @@ def _extract_pod_info(pod: client.V1Pod) -> PodInfo:
                 info["state"] = f"terminated: {cs.state.terminated.reason or 'unknown'}"
         container_statuses_info.append(info)
 
+    # For unhealthy pods: capture diagnostics (why is it down?)
+    conditions: list[dict[str, str]] = []
+    last_terminated: list[dict[str, str]] = []
+    if unhealthy and status:
+        # Pod conditions that are not met (e.g. Ready=False)
+        for cond in status.conditions or []:
+            if cond.status != "True":
+                conditions.append({
+                    "type": cond.type or "",
+                    "reason": cond.reason or "",
+                    "message": cond.message or "",
+                })
+
+        # Last terminated state per container (exit code, crash reason)
+        for cs in status.container_statuses or []:
+            if cs.last_state and cs.last_state.terminated:
+                t = cs.last_state.terminated
+                last_terminated.append({
+                    "container": cs.name,
+                    "reason": t.reason or "",
+                    "exit_code": str(t.exit_code) if t.exit_code is not None else "",
+                    "finished_at": t.finished_at.isoformat() if t.finished_at else "",
+                })
+
     return PodInfo(
         name=pod.metadata.name,
         namespace=pod.metadata.namespace,
@@ -134,6 +192,8 @@ def _extract_pod_info(pod: client.V1Pod) -> PodInfo:
         ready=all_ready,
         age=_compute_age(pod.metadata.creation_timestamp),
         container_statuses=container_statuses_info,
+        conditions=conditions,
+        last_terminated=last_terminated,
     )
 
 
@@ -269,9 +329,11 @@ class K8sInvestigator:
             )
             self._collect_events(core_api, ns, data)
 
-        # Collect logs for all pods in data.pods (already filtered to relevant only)
+        # Collect logs: running pods get current logs only,
+        # unhealthy pods also get previous logs + diagnostics are already in PodInfo
         for pod in data.pods:
-            self._collect_pod_logs(core_api, pod, max_log_lines, data)
+            is_down = pod in data.unhealthy_pods
+            self._collect_pod_logs(core_api, pod, max_log_lines, data, is_down)
 
         return data
 
@@ -312,8 +374,8 @@ class K8sInvestigator:
             pods = core_api.list_namespaced_pod(namespace=namespace)
             for pod in pods.items:
                 data.total_pod_count += 1
-                pod_info = _extract_pod_info(pod)
                 unhealthy = _is_unhealthy(pod)
+                pod_info = _extract_pod_info(pod, unhealthy=unhealthy)
                 targeted = self._matches_targets(
                     pod_info, target_pod_names, target_service_names,
                 )
@@ -369,11 +431,12 @@ class K8sInvestigator:
         pod: PodInfo,
         max_log_lines: int,
         data: InvestigationData,
+        is_unhealthy: bool = False,
     ) -> None:
         for cs in pod.container_statuses:
             container_name = cs["name"]
 
-            # Current container logs
+            # Current container logs (always collected)
             try:
                 logs = core_api.read_namespaced_pod_log(
                     name=pod.name,
@@ -395,23 +458,25 @@ class K8sInvestigator:
                 logger.warning(msg)
                 data.errors.append(msg)
 
-            # Previous container logs (for CrashLoopBackOff)
-            try:
-                prev_logs = core_api.read_namespaced_pod_log(
-                    name=pod.name,
-                    namespace=pod.namespace,
-                    container=container_name,
-                    tail_lines=max_log_lines,
-                    previous=True,
-                )
-                if prev_logs:
-                    data.pod_logs.append(PodLogSnippet(
-                        pod_name=pod.name,
+            # Previous container logs — only for unhealthy pods (crash diagnostics).
+            # Running pods don't need previous logs; their current logs have the evidence.
+            if is_unhealthy:
+                try:
+                    prev_logs = core_api.read_namespaced_pod_log(
+                        name=pod.name,
                         namespace=pod.namespace,
-                        container_name=container_name,
-                        log_lines=prev_logs,
-                        is_previous=True,
-                    ))
-            except ApiException:
-                # Previous logs not available is normal — not an error
-                pass
+                        container=container_name,
+                        tail_lines=max_log_lines,
+                        previous=True,
+                    )
+                    if prev_logs:
+                        data.pod_logs.append(PodLogSnippet(
+                            pod_name=pod.name,
+                            namespace=pod.namespace,
+                            container_name=container_name,
+                            log_lines=prev_logs,
+                            is_previous=True,
+                        ))
+                except ApiException:
+                    # Previous logs not available is normal
+                    pass

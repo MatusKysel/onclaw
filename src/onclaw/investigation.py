@@ -218,6 +218,7 @@ class InvestigationOrchestrator:
             target_pods = self._resolve_targets(
                 classification, event, past_records,
             )
+            remembered_pod_targets = list(target_pods)
             logger.info("Target pods for investigation: %s", target_pods)
 
             # 4. Collect K8s data only for targeted + unhealthy pods
@@ -239,7 +240,60 @@ class InvestigationOrchestrator:
                 len(data.errors),
             )
 
-            # 4. Generate SHORT AI summary
+            # 4b. Multi-hop follow-up — chase leads across pods
+            if self._config.max_follow_up_depth > 0 and data.pod_logs:
+                all_pod_names = self._k8s.list_pod_names(
+                    context=classification.context,
+                    namespaces=classification.namespaces,
+                )
+                investigated = {
+                    f"{p.namespace}/{p.name}" for p in data.pods
+                }
+                latest_data = data
+
+                for depth in range(self._config.max_follow_up_depth):
+                    remaining = [
+                        p for p in all_pod_names if p not in investigated
+                    ]
+                    if not remaining:
+                        break
+
+                    follow_ups = self._summarizer.suggest_follow_up_pods(
+                        data=latest_data,
+                        available_pods=remaining,
+                        investigated=list(investigated),
+                    )
+                    if not follow_ups:
+                        break
+
+                    logger.info(
+                        "Follow-up round %d: investigating %s",
+                        depth + 1, follow_ups,
+                    )
+
+                    latest_data = self._k8s.investigate(
+                        context=classification.context,
+                        namespaces=classification.namespaces,
+                        max_log_lines=self._config.max_log_lines,
+                        target_pod_names=follow_ups,
+                    )
+                    data.merge(latest_data)
+                    found_follow_ups = {
+                        f"{p.namespace}/{p.name}" for p in latest_data.pods
+                    }
+                    remembered_pod_targets.extend(
+                        pod_name for pod_name in follow_ups if pod_name in found_follow_ups
+                    )
+                    investigated.update(
+                        f"{p.namespace}/{p.name}" for p in latest_data.pods
+                    )
+
+                    logger.info(
+                        "After follow-up %d: %d total pods investigated",
+                        depth + 1, len(data.pods),
+                    )
+
+            # 5. Generate SHORT AI summary
             summary = self._summarizer.summarize(
                 alert_text=event.text,
                 investigation_data=data,
@@ -247,7 +301,7 @@ class InvestigationOrchestrator:
                 detailed=False,
             )
 
-            # 5. Post short reply and cache data for expansion
+            # 6. Post short reply and cache data for expansion
             reply_id = notifier.post_reply(event, summary)
 
             if reply_id:
@@ -266,10 +320,10 @@ class InvestigationOrchestrator:
                     while len(self._cache) > MAX_CACHE_SIZE:
                         self._cache.popitem(last=False)
 
-            # 6. Signal completion
+            # 7. Signal completion
             notifier.indicate_complete(event)
 
-            # 7. Store this investigation in memory (with resolved targets,
+            # 8. Store this investigation in memory (with resolved targets,
             #    so future alerts can reuse them without AI selection)
             self._memory.store(InvestigationRecord(
                 timestamp=datetime.now(timezone.utc).isoformat(),
@@ -278,7 +332,7 @@ class InvestigationOrchestrator:
                 severity=classification.severity,
                 context=classification.context,
                 namespaces=classification.namespaces,
-                pod_names=target_pods,
+                pod_names=list(dict.fromkeys(remembered_pod_targets)),
                 service_names=classification.service_names,
                 unhealthy_pods=[p.name for p in data.unhealthy_pods],
                 summary=summary,

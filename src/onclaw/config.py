@@ -20,6 +20,7 @@ class OnclawConfig(BaseModel):
     claude_max_tokens: int = 4096
     max_log_lines: int = 200
     max_concurrent_investigations: int = 3
+    max_follow_up_depth: int = 3
 
     @model_validator(mode="after")
     def check_platform_configured(self) -> OnclawConfig:
@@ -104,5 +105,8 @@ def load_config(config_path: str | Path | None = None) -> OnclawConfig:
         max_log_lines=int(_env_or("MAX_LOG_LINES", "max_log_lines", 200)),
         max_concurrent_investigations=int(
             _env_or("MAX_CONCURRENT_INVESTIGATIONS", "max_concurrent_investigations", 3)
+        ),
+        max_follow_up_depth=int(
+            _env_or("MAX_FOLLOW_UP_DEPTH", "max_follow_up_depth", 3)
         ),
     )

@@ -10,6 +10,8 @@
 # Optional overrides (all have sensible defaults):
 # kubeconfig_path: ~/.kube/config     # auto-detected, or set KUBECONFIG env var
 # claude_model: claude-sonnet-4-20250514
+# claude_fast_model: claude-haiku-4-5-20251001
 # claude_max_tokens: 4096
 # max_log_lines: 200
 # max_concurrent_investigations: 3
+# max_follow_up_depth: 3

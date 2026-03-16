@@ -86,6 +86,30 @@ All pods:
 Return ONLY a valid JSON array of pod identifiers from the list above. \
 Pick pods whose names relate to the alert keywords. Example: ["ns/pod-0", "ns/pod-1"]"""
 
+FOLLOW_UP_PROMPT = """\
+You are an SRE assistant investigating a Kubernetes incident. You have collected logs and events \
+from some pods. Analyze the evidence and determine if any OTHER pods should be investigated next.
+
+Look for clues in logs and events:
+- Connection errors pointing to other services (e.g. "connection refused to redis:6379")
+- Dependency failures (e.g. "cannot connect to auth-service", "timeout calling payment-api")
+- References to other pod/service names in error messages
+- Upstream/downstream service issues
+
+Already investigated: {investigated}
+
+Available pods to investigate:
+{available_pods}
+
+Evidence from current investigation:
+{evidence}
+
+Return ONLY valid JSON, no markdown:
+{{"follow_up_pods": ["ns/pod-name"], "reason": "brief reason"}}
+
+If no follow-up is needed, return: {{"follow_up_pods": [], "reason": ""}}
+Only suggest pods from the "Available pods" list. Max 3 pods."""
+
 MAX_PROMPT_CHARS = 150_000
 
 
@@ -133,13 +157,38 @@ def _format_investigation_data(data: InvestigationData) -> str:
             )
         sections.append("\n".join(lines))
 
-    # Unhealthy pod details
+    # Unhealthy pod diagnostics — why is it down?
     if data.unhealthy_pods:
-        lines = ["*Unhealthy Pod Details:*"]
+        lines = ["*Unhealthy Pod Diagnostics (why is it down?):*"]
         for p in data.unhealthy_pods:
             lines.append(f"  `{p.namespace}/{p.name}`:")
             for cs in p.container_statuses:
                 lines.append(f"    container `{cs['name']}`: {cs.get('state', 'unknown')}")
+            # Pod conditions not met (e.g. Ready=False with reason)
+            if p.conditions:
+                for cond in p.conditions:
+                    lines.append(
+                        f"    condition {cond['type']}: {cond['reason']}"
+                        + (f" — {cond['message']}" if cond['message'] else "")
+                    )
+            # Last terminated state (exit code, crash reason)
+            if p.last_terminated:
+                for lt in p.last_terminated:
+                    lines.append(
+                        f"    container `{lt['container']}` last terminated: "
+                        f"reason={lt['reason']}, exit_code={lt['exit_code']}"
+                        + (f", at {lt['finished_at']}" if lt['finished_at'] else "")
+                    )
+            # Pod-specific warning events (exact match after Kind/)
+            pod_events = [
+                ev for ev in data.events
+                if ev.involved_object.endswith(f"/{p.name}")
+            ]
+            if pod_events:
+                for ev in pod_events:
+                    lines.append(
+                        f"    event: {ev.reason} — {ev.message} (x{ev.count})"
+                    )
         sections.append("\n".join(lines))
 
     # Pod logs
@@ -255,6 +304,60 @@ class AISummarizer:
         except Exception as e:
             logger.warning("Failed to select pods via AI: %s", e)
         return []
+
+    def suggest_follow_up_pods(
+        self,
+        data: InvestigationData,
+        available_pods: list[str],
+        investigated: list[str],
+    ) -> list[str]:
+        """Analyze logs/events and suggest additional pods to investigate."""
+        if not available_pods:
+            return []
+
+        # Format just logs and events as evidence (trimmed to save tokens)
+        evidence_lines: list[str] = []
+        for log in data.pod_logs:
+            label = f"{log.namespace}/{log.pod_name}/{log.container_name}"
+            if log.is_previous:
+                label += " (previous)"
+            lines = log.log_lines.strip().split("\n")[-50:]
+            evidence_lines.append(f"Logs from {label}:\n" + "\n".join(lines))
+        for ev in data.events:
+            evidence_lines.append(
+                f"Event: {ev.involved_object} — {ev.reason}: {ev.message}"
+            )
+        evidence = "\n\n".join(evidence_lines)
+        if len(evidence) > 20_000:
+            evidence = evidence[:20_000] + "\n... (truncated)"
+
+        prompt = FOLLOW_UP_PROMPT.format(
+            investigated=", ".join(investigated),
+            available_pods="\n".join(f"- {p}" for p in available_pods),
+            evidence=evidence,
+        )
+
+        try:
+            response = self._client.messages.create(
+                model=self._fast_model,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.content[0].text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+                raw = raw.rsplit("```", 1)[0].strip()
+            parsed = json.loads(raw)
+            follow_ups = parsed.get("follow_up_pods", [])
+            reason = parsed.get("reason", "")
+            if follow_ups and reason:
+                logger.info(
+                    "AI suggests follow-up pods: %s (reason: %s)", follow_ups, reason
+                )
+            return [str(p) for p in follow_ups] if isinstance(follow_ups, list) else []
+        except Exception as e:
+            logger.warning("Failed to get follow-up suggestions: %s", e)
+            return []
 
     def _build_user_message(
         self,

@@ -148,6 +148,83 @@ class TestMatchesTargets:
         assert K8sInvestigator._matches_targets(pod, ["prover"], ["sequencer"]) is False
 
 
+class TestInvestigationDataMerge:
+    def test_merge_deduplicates_pods_and_logs(self) -> None:
+        from onclaw.k8s_investigator import (
+            InvestigationData, K8sEvent, PodInfo, PodLogSnippet,
+        )
+
+        pod_a = PodInfo(
+            name="api-0", namespace="app", status="Running",
+            restart_count=0, ready=True, age="1d",
+            container_statuses=[{"name": "main"}],
+        )
+        pod_b = PodInfo(
+            name="redis-0", namespace="app", status="Running",
+            restart_count=2, ready=True, age="3d",
+            container_statuses=[{"name": "redis"}],
+        )
+
+        data1 = InvestigationData(
+            timestamp="t1", context_used="ctx", namespaces_checked=["app"],
+            pods=[pod_a], total_pod_count=5,
+            pod_logs=[PodLogSnippet(
+                pod_name="api-0", namespace="app",
+                container_name="main", log_lines="log1",
+            )],
+            events=[K8sEvent(
+                namespace="app", involved_object="Pod/api-0",
+                reason="Pulled", message="pulled image", count=1,
+                last_timestamp="t1",
+            )],
+        )
+
+        data2 = InvestigationData(
+            timestamp="t2", context_used="ctx", namespaces_checked=["app"],
+            pods=[pod_a, pod_b],  # pod_a is a duplicate
+            total_pod_count=5,
+            pod_logs=[
+                # Duplicate log
+                PodLogSnippet(
+                    pod_name="api-0", namespace="app",
+                    container_name="main", log_lines="log1 again",
+                ),
+                # New log
+                PodLogSnippet(
+                    pod_name="redis-0", namespace="app",
+                    container_name="redis", log_lines="redis log",
+                ),
+            ],
+            events=[
+                # Duplicate event
+                K8sEvent(
+                    namespace="app", involved_object="Pod/api-0",
+                    reason="Pulled", message="pulled image", count=1,
+                    last_timestamp="t2",
+                ),
+                # New event
+                K8sEvent(
+                    namespace="app", involved_object="Pod/redis-0",
+                    reason="BackOff", message="back-off", count=3,
+                    last_timestamp="t2",
+                ),
+            ],
+        )
+
+        data1.merge(data2)
+
+        # Pods deduplicated
+        assert len(data1.pods) == 2
+        pod_names = {p.name for p in data1.pods}
+        assert pod_names == {"api-0", "redis-0"}
+
+        # Logs deduplicated (same pod/container/is_previous)
+        assert len(data1.pod_logs) == 2
+
+        # Events deduplicated
+        assert len(data1.events) == 2
+
+
 class TestK8sInvestigator:
     @patch("onclaw.k8s_investigator.k8s_config")
     @patch("onclaw.k8s_investigator.client.CoreV1Api")

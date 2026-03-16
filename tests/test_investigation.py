@@ -337,6 +337,175 @@ class TestInvestigationOrchestrator:
         call_kwargs = mock_k8s.investigate.call_args.kwargs
         assert call_kwargs["target_pod_names"] == ["prover/prover-1"]
 
+    def test_follow_up_investigation(self, tmp_path: Path) -> None:
+        """AI suggests follow-up pods based on logs → those pods get investigated too."""
+        orchestrator, mock_k8s, mock_summarizer, notifier, _ = _make_orchestrator(tmp_path)
+
+        # Override config to enable follow-ups
+        orchestrator._config.max_follow_up_depth = 2
+
+        from onclaw.k8s_investigator import PodInfo, PodLogSnippet
+
+        # Initial investigation returns data with logs mentioning another pod
+        initial_data = InvestigationData(
+            timestamp="2025-01-15T10:30:00Z",
+            context_used="mainnet",
+            namespaces_checked=["app"],
+            total_pod_count=5,
+            pods=[PodInfo(
+                name="api-0", namespace="app", status="Running",
+                restart_count=0, ready=True, age="5d", container_statuses=[{"name": "main"}],
+            )],
+            pod_logs=[PodLogSnippet(
+                pod_name="api-0", namespace="app", container_name="main",
+                log_lines="ERROR: connection refused to redis-master-0:6379",
+            )],
+        )
+        # Follow-up investigation returns redis data
+        followup_data = InvestigationData(
+            timestamp="2025-01-15T10:31:00Z",
+            context_used="mainnet",
+            namespaces_checked=["app"],
+            total_pod_count=5,
+            pods=[PodInfo(
+                name="redis-master-0", namespace="app", status="Running",
+                restart_count=3, ready=True, age="5d", container_statuses=[{"name": "redis"}],
+            )],
+            pod_logs=[PodLogSnippet(
+                pod_name="redis-master-0", namespace="app", container_name="redis",
+                log_lines="OOM: memory limit exceeded",
+            )],
+        )
+
+        mock_k8s.investigate.side_effect = [initial_data, followup_data]
+        mock_k8s.list_pod_names.return_value = [
+            "app/api-0", "app/api-1", "app/redis-master-0", "app/worker-0",
+        ]
+
+        # AI suggests redis-master-0 as follow-up, then no more
+        mock_summarizer.suggest_follow_up_pods.side_effect = [
+            ["app/redis-master-0"],
+            [],  # no further follow-ups
+        ]
+
+        classification = AlertClassification(
+            is_alert=True,
+            severity="critical",
+            context="mainnet",
+            namespaces=["app"],
+            pod_names=["api-0"],
+            service_names=[],
+        )
+        event = _make_event(message_id="follow.up", text="api errors")
+
+        orchestrator._run(classification, event, notifier, "C001:follow.up")
+
+        # Two investigate calls: initial + follow-up
+        assert mock_k8s.investigate.call_count == 2
+
+        # Follow-up was called with redis pod
+        followup_call = mock_k8s.investigate.call_args_list[1]
+        assert followup_call.kwargs["target_pod_names"] == ["app/redis-master-0"]
+
+        # AI was asked to suggest follow-ups
+        assert mock_summarizer.suggest_follow_up_pods.call_count == 2
+
+        # Summarizer received merged data (both pods' logs)
+        summary_call = mock_summarizer.summarize.call_args
+        merged = summary_call.kwargs["investigation_data"]
+        assert len(merged.pods) == 2
+        assert len(merged.pod_logs) == 2
+
+    def test_follow_up_skipped_when_no_logs(self, tmp_path: Path) -> None:
+        """Follow-up loop doesn't run when initial investigation has no logs."""
+        orchestrator, mock_k8s, mock_summarizer, notifier, _ = _make_orchestrator(tmp_path)
+        orchestrator._config.max_follow_up_depth = 2
+
+        # Default mock returns data with no pod_logs
+        classification = AlertClassification(
+            is_alert=True,
+            severity="warning",
+            context="mainnet",
+            namespaces=["prover"],
+            pod_names=["prover-0"],
+            service_names=[],
+        )
+        event = _make_event(message_id="no.logs", text="alert")
+
+        orchestrator._run(classification, event, notifier, "C001:no.logs")
+
+        # Follow-up should not be attempted
+        mock_summarizer.suggest_follow_up_pods.assert_not_called()
+
+    def test_memory_only_stores_deliberate_targets(self, tmp_path: Path) -> None:
+        """Memory persists AI-selected and follow-up pods, not incidental unhealthy pods."""
+        orchestrator, mock_k8s, mock_summarizer, notifier, memory = _make_orchestrator(tmp_path)
+        orchestrator._config.max_follow_up_depth = 2
+
+        from onclaw.k8s_investigator import PodInfo, PodLogSnippet
+
+        mock_summarizer.select_pods.return_value = ["app/api-0"]
+
+        initial_target = PodInfo(
+            name="api-0", namespace="app", status="Running",
+            restart_count=0, ready=True, age="5d", container_statuses=[{"name": "main"}],
+        )
+        incidental_unhealthy = PodInfo(
+            name="crashy-0", namespace="app", status="CrashLoopBackOff",
+            restart_count=7, ready=False, age="2d", container_statuses=[{"name": "main"}],
+        )
+        initial_data = InvestigationData(
+            timestamp="2025-01-15T10:30:00Z",
+            context_used="mainnet",
+            namespaces_checked=["app"],
+            total_pod_count=5,
+            pods=[initial_target, incidental_unhealthy],
+            unhealthy_pods=[incidental_unhealthy],
+            pod_logs=[PodLogSnippet(
+                pod_name="api-0", namespace="app", container_name="main",
+                log_lines="ERROR: connection refused to redis-master-0:6379",
+            )],
+        )
+        followup_data = InvestigationData(
+            timestamp="2025-01-15T10:31:00Z",
+            context_used="mainnet",
+            namespaces_checked=["app"],
+            total_pod_count=5,
+            pods=[PodInfo(
+                name="redis-master-0", namespace="app", status="Running",
+                restart_count=1, ready=True, age="5d", container_statuses=[{"name": "redis"}],
+            )],
+            pod_logs=[PodLogSnippet(
+                pod_name="redis-master-0", namespace="app", container_name="redis",
+                log_lines="OOM: memory limit exceeded",
+            )],
+        )
+
+        mock_k8s.investigate.side_effect = [initial_data, followup_data]
+        mock_k8s.list_pod_names.return_value = [
+            "app/api-0", "app/redis-master-0", "app/crashy-0",
+        ]
+        mock_summarizer.suggest_follow_up_pods.side_effect = [
+            ["app/redis-master-0"],
+            [],
+        ]
+
+        classification = AlertClassification(
+            is_alert=True,
+            severity="critical",
+            context="mainnet",
+            namespaces=["app"],
+            pod_names=[],
+            service_names=[],
+        )
+        event = _make_event(message_id="memory.targets", text="api cannot reach redis")
+
+        orchestrator._run(classification, event, notifier, "C001:memory.targets")
+
+        records = memory.search("api cannot reach redis")
+        assert len(records) == 1
+        assert records[0].pod_names == ["app/api-0", "app/redis-master-0"]
+
     def test_deduplication(self, tmp_path: Path) -> None:
         orchestrator, _, _, notifier, _ = _make_orchestrator(tmp_path)
 
